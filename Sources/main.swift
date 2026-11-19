@@ -82,6 +82,7 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
     v.device = device; v.delegate = self
     v.colorPixelFormat = .bgra8Unorm; v.framebufferOnly = true
     v.preferredFramesPerSecond = NSScreen.main?.maximumFramesPerSecond ?? 60
+    v.presentsWithTransaction = false // present immediately, don't sync with Core Animation commit
     let lib = try! device.makeLibrary(source: shaderSource, options: nil)
     func pipe(_ name: String, _ fmt: MTLPixelFormat) -> MTLRenderPipelineState {
       let d = MTLRenderPipelineDescriptor()
@@ -209,12 +210,13 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
 
 final class KeyWindow: NSWindow { override var canBecomeKey: Bool { true } }
 
-final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
-  var win: KeyWindow!, web: WKWebView!, overlay: NSWindow!, mtk: MTKView!
+final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate {
+  var win: KeyWindow!, web: WKWebView!, overlay: NSWindow!, mtk: MTKView!, splash: SplashView!
   let renderer = Renderer()
   var stream: SCStream?
   var locked = false, moveDX = 0.0, moveDY = 0.0, moveInFlight = false
   var savedFrame: NSRect?
+  var didLoad = false
 
   func applicationDidFinishLaunching(_ n: Notification) {
     buildMenu()
@@ -229,15 +231,37 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     web = WKWebView(frame: .zero, configuration: cfg)
     web.customUserAgent = safariUA
     web.isInspectable = true
+    web.navigationDelegate = self
     let occl = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:") // keep painting even when covered
     if web.responds(to: occl) { web.perform(occl, with: false) }
 
     win = KeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1600, height: 900),
                     styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
-    win.title = "Turbine"; win.backgroundColor = .black; win.contentView = web
+    win.title = "Turbine"; win.backgroundColor = NSColor(red: 0.106, green: 0.039, blue: 0.165, alpha: 1)
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 1600, height: 900))
+    container.autoresizesSubviews = true
+    web.frame = container.bounds; web.autoresizingMask = [.width, .height]
+    splash = SplashView(frame: container.bounds); splash.autoresizingMask = [.width, .height]
+    container.addSubview(web); container.addSubview(splash)
+    win.contentView = container
     win.collectionBehavior = [.fullScreenNone] // Cmd+F does a borderless fullscreen so the overlay can follow
     win.center(); win.makeKeyAndOrderFront(nil)
-    web.load(URLRequest(url: URL(string: "https://play.xbox.com/")!))
+
+    // Import the user's own Chrome login for the Xbox domains. Load right away so a Keychain prompt
+    // never blocks the stream; if cookies come in, reload so the page picks up the session.
+    splash.setStatus("Grabbing your browser login")
+    var loaded = false
+    let load = { [weak self] in guard let self, !loaded else { return }; loaded = true
+      self.web.load(URLRequest(url: URL(string: "https://play.xbox.com/")!)) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { load() } // fall back if a prompt stalls the import
+    CookieImporter.importInto(cfg.websiteDataStore.httpCookieStore) { [weak self] r in
+      guard let self else { return }
+      switch r {
+      case let .ok(n, br): self.splash.setStatus("Signed in from \(br) (\(n))"); if loaded { self.web.reload() } else { load() }
+      case .noData: self.splash.setStatus("Sign in once to save it"); if !loaded { load() }
+      case .denied: self.splash.setStatus("Allow browser access to auto-sign-in"); if !loaded { load() }; self.offerGrant()
+      }
+    }
 
     overlay = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
     // Non-opaque so macOS doesn't treat the web view as covered (WebKit stops painting covered windows).
@@ -266,10 +290,48 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
 
   func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
+  // Fade the themed splash once the page's first screen is up.
+  func webView(_ w: WKWebView, didFinish nav: WKNavigation!) {
+    guard !didLoad else { return }
+    didLoad = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.splash.fadeOut() }
+  }
+
+  // Re-import browser cookies on demand (menu / after signing in to the browser).
+  @objc func importChrome() {
+    splash.isHidden = false; splash.alphaValue = 1; splash.setStatus("Grabbing your browser login")
+    didLoad = false
+    CookieImporter.importInto(web.configuration.websiteDataStore.httpCookieStore) { [weak self] r in
+      guard let self else { return }
+      switch r {
+      case let .ok(n, br): self.splash.setStatus("Signed in from \(br) (\(n))"); self.web.reload()
+      case .noData: self.splash.setStatus("No Xbox login found in your browsers"); self.splash.fadeOut()
+      case .denied: self.splash.setStatus("Allow browser access to continue"); self.offerGrant()
+      }
+    }
+  }
+
+  // Shown once if macOS blocked reading the browser's data folder.
+  var offeredGrant = false
+  func offerGrant() {
+    guard !offeredGrant else { return }
+    offeredGrant = true
+    let a = NSAlert()
+    a.messageText = "Let Turbine read your browser login"
+    a.informativeText = "To sign in automatically, Turbine needs to read your browser's saved Xbox cookies. macOS asks for this the first time.\n\n1. Click “Allow” on the “Turbine wants to access data from…” and Keychain prompts.\n2. If you don't see a prompt, open System Settings and add Turbine under Privacy & Security, or just sign in once in the window — Turbine remembers it after that."
+    a.addButton(withTitle: "Open Privacy Settings")
+    a.addButton(withTitle: "I'll sign in manually")
+    if a.runModal() == .alertFirstButtonReturn {
+      NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy")!)
+    }
+  }
+
   func buildMenu() {
     let main = NSMenu()
     let appItem = NSMenuItem(); main.addItem(appItem)
     let appMenu = NSMenu(); appItem.submenu = appMenu
+    appMenu.addItem(withTitle: "Import Chrome Login", action: #selector(importChrome), keyEquivalent: "i").target = self
+    appMenu.addItem(.separator())
     appMenu.addItem(withTitle: "Quit Turbine", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     let editItem = NSMenuItem(); main.addItem(editItem)
     let edit = NSMenu(title: "Edit"); editItem.submenu = edit
@@ -294,8 +356,10 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     c.sourceRect = CGRect(x: r.minX, y: full.height - r.maxY, width: r.width, height: r.height)
     c.width = Int(r.width * scale) & ~1; c.height = Int(r.height * scale) & ~1
     c.pixelFormat = kCVPixelFormatType_32BGRA
-    c.minimumFrameInterval = CMTime(value: 1, timescale: 120)
-    c.queueDepth = 4; c.showsCursor = false
+    // Match the display refresh so frames arrive as fast as they can be shown; shallow queue = low latency.
+    c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(NSScreen.main?.maximumFramesPerSecond ?? 120))
+    c.queueDepth = 3; c.showsCursor = false
+    if #available(macOS 14.0, *) { c.captureResolution = .best }
     return c
   }
 
@@ -384,6 +448,112 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     }
     win.makeKeyAndOrderFront(nil)
     layout()
+  }
+}
+
+// MARK: - Themed splash
+
+// GTA VI inspired launch screen: deep violet with a sunset gradient and the spinning Turbine logo.
+final class SplashView: NSView {
+  let gradient = CAGradientLayer()
+  let glow = CALayer()
+  let rotor = CALayer()
+  let wordmark = CATextLayer()
+  let status = CATextLayer()
+  let accentTop = NSColor(red: 1.0, green: 0.70, blue: 0.28, alpha: 1)
+  let accentMid = NSColor(red: 1.0, green: 0.31, blue: 0.60, alpha: 1)
+  let accentBot = NSColor(red: 0.66, green: 0.33, blue: 0.97, alpha: 1)
+
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    wantsLayer = true
+    layer?.backgroundColor = NSColor(red: 0.106, green: 0.039, blue: 0.165, alpha: 1).cgColor
+
+    gradient.colors = [NSColor(red: 0.16, green: 0.05, blue: 0.22, alpha: 1).cgColor,
+                       NSColor(red: 0.30, green: 0.08, blue: 0.28, alpha: 1).cgColor,
+                       NSColor(red: 0.11, green: 0.04, blue: 0.17, alpha: 1).cgColor]
+    gradient.startPoint = CGPoint(x: 0, y: 1); gradient.endPoint = CGPoint(x: 1, y: 0)
+    layer?.addSublayer(gradient)
+
+    glow.backgroundColor = accentMid.withAlphaComponent(0.28).cgColor
+    layer?.addSublayer(glow)
+
+    rotor.contents = Self.rotorImage(accentTop, accentMid, accentBot)
+    rotor.contentsGravity = .resizeAspect
+    layer?.addSublayer(rotor)
+    let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+    spin.fromValue = 0; spin.toValue = -Double.pi * 2; spin.duration = 6; spin.repeatCount = .infinity
+    rotor.add(spin, forKey: "spin")
+
+    let font = NSFont(name: "SFProDisplay-Bold", size: 64) ?? NSFont.systemFont(ofSize: 64, weight: .bold)
+    wordmark.string = "TURBINE"; wordmark.font = font; wordmark.fontSize = 64
+    wordmark.foregroundColor = NSColor.white.cgColor
+    wordmark.alignmentMode = .center
+    layer?.addSublayer(wordmark)
+
+    status.string = ""; status.fontSize = 15
+    status.font = NSFont.systemFont(ofSize: 15, weight: .medium)
+    status.foregroundColor = accentMid.cgColor; status.alignmentMode = .center
+    layer?.addSublayer(status)
+    needsLayout = true
+  }
+  required init?(coder: NSCoder) { nil }
+
+  override func layout() {
+    super.layout()
+    CATransaction.begin(); CATransaction.setDisableActions(true)
+    let sc = window?.backingScaleFactor ?? 2
+    for l in [gradient, glow, rotor, wordmark, status] { l.contentsScale = sc; l.rasterizationScale = sc }
+    gradient.frame = bounds
+    let cx = bounds.midX, cy = bounds.midY + 40
+    let g: CGFloat = 360; glow.frame = CGRect(x: cx - g / 2, y: cy - g / 2, width: g, height: g); glow.cornerRadius = g / 2
+    let r: CGFloat = 150; rotor.frame = CGRect(x: cx - r / 2, y: cy - r / 2, width: r, height: r)
+    wordmark.frame = CGRect(x: 0, y: cy - r / 2 - 92, width: bounds.width, height: 76)
+    status.frame = CGRect(x: 0, y: cy - r / 2 - 120, width: bounds.width, height: 22)
+    CATransaction.commit()
+  }
+
+  func setStatus(_ s: String) {
+    DispatchQueue.main.async { CATransaction.begin(); CATransaction.setDisableActions(true); self.status.string = s; CATransaction.commit() }
+  }
+
+  func fadeOut() {
+    let a = CABasicAnimation(keyPath: "opacity")
+    a.fromValue = 1; a.toValue = 0; a.duration = 0.5; a.fillMode = .forwards; a.isRemovedOnCompletion = false
+    layer?.add(a, forKey: "fade")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { self.isHidden = true; self.layer?.removeAnimation(forKey: "fade") }
+  }
+
+  // Seven-blade turbine rotor drawn once into an image.
+  static func rotorImage(_ top: NSColor, _ mid: NSColor, _ bot: NSColor) -> CGImage {
+    let px = 300
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
+      samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    let ctx = NSGraphicsContext.current!.cgContext
+    ctx.translateBy(x: 150, y: 150); ctx.scaleBy(x: 1.3, y: 1.3)
+    let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+      colors: [top.cgColor, mid.cgColor, bot.cgColor] as CFArray, locations: [0, 0.5, 1])!
+    let ring = CGMutablePath(); ring.addArc(center: .zero, radius: 100, startAngle: 0, endAngle: .pi * 2, clockwise: false)
+    ctx.addPath(ring); ctx.setLineWidth(6); ctx.replacePathWithStrokedPath(); ctx.clip()
+    ctx.drawLinearGradient(grad, start: CGPoint(x: -100, y: 100), end: CGPoint(x: 100, y: -100), options: [])
+    NSGraphicsContext.current!.cgContext.resetClip()
+    let blade = CGMutablePath()
+    blade.move(to: CGPoint(x: 0, y: 20))
+    blade.addCurve(to: CGPoint(x: 30, y: 96), control1: CGPoint(x: 26, y: 28), control2: CGPoint(x: 54, y: 58))
+    blade.addCurve(to: CGPoint(x: -8, y: 22), control1: CGPoint(x: 16, y: 74), control2: CGPoint(x: 2, y: 48))
+    blade.closeSubpath()
+    for i in 0..<7 {
+      ctx.saveGState(); ctx.rotate(by: CGFloat(i) * .pi * 2 / 7)
+      ctx.addPath(blade); ctx.clip()
+      ctx.drawLinearGradient(grad, start: CGPoint(x: -50, y: 0), end: CGPoint(x: 50, y: 96), options: [])
+      ctx.restoreGState()
+    }
+    ctx.setFillColor(NSColor(red: 0.106, green: 0.039, blue: 0.165, alpha: 1).cgColor)
+    ctx.addArc(center: .zero, radius: 18, startAngle: 0, endAngle: .pi * 2, clockwise: false); ctx.fillPath()
+    NSGraphicsContext.restoreGraphicsState()
+    return rep.cgImage!
   }
 }
 

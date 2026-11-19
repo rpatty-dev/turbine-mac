@@ -52,3 +52,28 @@ Turbine isn't affiliated with or endorsed by Rockstar Games, Take-Two Interactiv
 ## License
 
 MIT
+
+## Stop re-granting Screen Recording on every rebuild
+
+Each ad-hoc build has a new signature, so macOS treats it as a new app and re-asks for Screen
+Recording. Give it one stable self-signed identity and the grant sticks across all future builds.
+
+A "Turbine Dev" code-signing cert is already in your login keychain. Trust it once (asks for your
+login password — this is a security change, so you run it yourself):
+
+```bash
+security find-certificate -c "Turbine Dev" -p ~/Library/Keychains/login.keychain-db > /tmp/turbine-dev.cer
+security add-trusted-cert -r trustAsRoot -p codeSign -k ~/Library/Keychains/login.keychain-db /tmp/turbine-dev.cer
+rm /tmp/turbine-dev.cer
+```
+
+Then rebuild and reinstall once:
+
+```bash
+./build.sh && rm -rf /Applications/Turbine.app && cp -R build/Turbine.app /Applications/ && open /Applications/Turbine.app
+```
+
+Grant Screen Recording one last time for this signed build. From now on `./build.sh` signs with the
+same identity, so the permission (and the Chrome access) persist across rebuilds.
+
+To undo: open Keychain Access, find "Turbine Dev" under login, delete it. Builds fall back to ad-hoc.

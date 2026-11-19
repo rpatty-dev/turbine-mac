@@ -27,5 +27,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
 </dict></plist>
 PLIST
-codesign --force -s - "$APP"
+# Use the stable "Turbine Dev" identity if present (so Screen Recording & other permissions persist
+# across rebuilds); otherwise fall back to ad-hoc. See README for one-time setup.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Turbine Dev"; then
+  codesign --force --deep -s "Turbine Dev" "$APP"
+else
+  codesign --force -s - "$APP"
+fi
 echo "Built $APP"

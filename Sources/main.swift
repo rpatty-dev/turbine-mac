@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import CoreMedia
 import MetalFX
 import MetalKit
@@ -56,7 +57,7 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
   var pLuma: MTLRenderPipelineState!, pFlow: MTLRenderPipelineState!, pPresent: MTLRenderPipelineState!
   weak var view: MTKView?
 
-  var upscaleOn = true, frameGenOn = true
+  var upscaleOn = ProcessInfo.processInfo.environment["TURBINE_NOFX"] == nil, frameGenOn = true
   var scaler: MTLFXSpatialScaler?
   var sizeKey = ""
   var ups: [MTLTexture] = [], lumas: [MTLTexture] = []
@@ -72,6 +73,9 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
   var lastT = 1.0, interpolating = false
   var fgActive = false, flipSince = 0.0
   var status = "METALFX on  FRAMEGEN starting"
+  var dumped = false
+  let startTime = CACurrentMediaTime()
+  var onFirstFrame: (() -> Void)? // reveals the overlay once there is a real frame to show
 
   func attach(_ v: MTKView) {
     view = v
@@ -93,6 +97,13 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
     guard type == .screen, let pb = sb.imageBuffer,
           let info = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
           (info[.status] as? Int) == SCFrameStatus.complete.rawValue else { return }
+    if ProcessInfo.processInfo.environment["TURBINE_DUMP"] != nil, !dumped, CACurrentMediaTime() - startTime > 8 { // debug: save one captured frame
+      dumped = true
+      let ci = CIImage(cvPixelBuffer: pb)
+      if let cg = CIContext().createCGImage(ci, from: ci.extent) {
+        try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: NSTemporaryDirectory() + "turbine-frame.png"))
+      }
+    }
     lock.lock(); pending = pb; pendingAt = CACurrentMediaTime(); lock.unlock()
   }
 
@@ -185,6 +196,7 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
     guard ups.count == 2, let drawable = v.currentDrawable else { cb.commit(); return }
     pass(cb, pPresent, drawable.texture, [ups[interpolating ? 0 : 1], ups[1], flowTex], [Float(interpolating ? t : 1)])
     cb.present(drawable)
+    if let f = onFirstFrame { onFirstFrame = nil; cb.addScheduledHandler { _ in DispatchQueue.main.async(execute: f) } }
     cb.commit()
     lastT = interpolating ? t : 1
 
@@ -217,6 +229,8 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     web = WKWebView(frame: .zero, configuration: cfg)
     web.customUserAgent = safariUA
     web.isInspectable = true
+    let occl = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:") // keep painting even when covered
+    if web.responds(to: occl) { web.perform(occl, with: false) }
 
     win = KeyWindow(contentRect: NSRect(x: 0, y: 0, width: 1600, height: 900),
                     styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
@@ -226,9 +240,11 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
     web.load(URLRequest(url: URL(string: "https://play.xbox.com/")!))
 
     overlay = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
-    overlay.ignoresMouseEvents = true; overlay.isOpaque = true; overlay.backgroundColor = .black; overlay.hasShadow = false
+    // Non-opaque so macOS doesn't treat the web view as covered (WebKit stops painting covered windows).
+    overlay.ignoresMouseEvents = true; overlay.isOpaque = false; overlay.alphaValue = 0; overlay.backgroundColor = .clear; overlay.hasShadow = false
     mtk = MTKView(frame: .zero, device: renderer.device)
     renderer.attach(mtk)
+    renderer.onFirstFrame = { [weak self] in self?.overlay.alphaValue = 1; NSLog("Turbine: first frame shown") }
     overlay.contentView = mtk
     win.addChildWindow(overlay, ordered: .above)
 
@@ -286,12 +302,16 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler {
   func startCapture() async {
     do {
       let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-      guard let w = content.windows.first(where: { $0.windowID == CGWindowID(win.windowNumber) }) else { return }
+      guard let w = content.windows.first(where: { $0.windowID == CGWindowID(win.windowNumber) }) else {
+        NSLog("Turbine: own window \(win.windowNumber) not in shareable content (\(content.windows.count) windows)"); return
+      }
       let s = SCStream(filter: SCContentFilter(desktopIndependentWindow: w), configuration: captureConfig(), delegate: nil)
       try s.addStreamOutput(renderer, type: .screen, sampleHandlerQueue: DispatchQueue(label: "turbine.capture", qos: .userInteractive))
       try await s.startCapture()
       stream = s
+      NSLog("Turbine: capture started")
     } catch {
+      NSLog("Turbine: capture failed: \(error)")
       let a = NSAlert()
       a.messageText = "Turbine needs Screen Recording permission"
       a.informativeText = "Allow Turbine in System Settings → Privacy & Security → Screen & System Audio Recording, then reopen Turbine. Until then the stream shows without upscaling or frame generation."

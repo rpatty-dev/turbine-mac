@@ -77,6 +77,25 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
   let startTime = CACurrentMediaTime()
   var onFirstFrame: (() -> Void)? // reveals the overlay once there is a real frame to show
 
+  // Duplicate detection: xCloud pads a 30 fps game to a 60 fps stream by repeating frames.
+  // Dropping the repeats makes the pipeline see the real 30 fps motion, so frame gen engages.
+  var lastSample = [UInt8](), lastUniqueAt = 0.0
+  func isDuplicate(_ pb: CVPixelBuffer) -> Bool {
+    CVPixelBufferLockBaseAddress(pb, .readOnly); defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pb) else { return false }
+    let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb), bpr = CVPixelBufferGetBytesPerRow(pb)
+    let cols = 32, rows = 18, n = cols * rows
+    var s = [UInt8](repeating: 0, count: n)
+    let p = base.assumingMemoryBound(to: UInt8.self)
+    var idx = 0
+    for ry in 0..<rows { let y = (h * ry) / rows
+      for rx in 0..<cols { let x = (w * rx) / cols; s[idx] = p[y * bpr + x * 4 + 1]; idx += 1 } } // G channel ≈ luma
+    defer { lastSample = s }
+    guard lastSample.count == n else { return false }
+    var sad = 0; for i in 0..<n { sad += abs(Int(s[i]) - Int(lastSample[i])) }
+    return sad < n * 3 // average difference < 3/255 => same frame
+  }
+
   func attach(_ v: MTKView) {
     view = v
     v.device = device; v.delegate = self
@@ -105,7 +124,11 @@ final class Renderer: NSObject, MTKViewDelegate, SCStreamOutput {
         try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: NSTemporaryDirectory() + "turbine-frame.png"))
       }
     }
-    lock.lock(); pending = pb; pendingAt = CACurrentMediaTime(); lock.unlock()
+    let now = CACurrentMediaTime()
+    // Drop padded duplicates (only with frame gen on); keep going on static scenes so nothing freezes.
+    if frameGenOn, isDuplicate(pb), now - lastUniqueAt < 0.12 { return }
+    lastUniqueAt = now
+    lock.lock(); pending = pb; pendingAt = now; lock.unlock()
   }
 
   func tex(_ w: Int, _ h: Int, _ f: MTLPixelFormat, _ extra: MTLTextureUsage = []) -> MTLTexture {
@@ -311,6 +334,27 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
     }
   }
 
+  // Compact mode: a small always-on-top window in the corner with the HUD hidden, for playing at a desk.
+  var compact = false
+  var savedNormal: NSRect?
+  @objc func toggleCompact() {
+    compact.toggle()
+    if compact {
+      savedNormal = win.frame
+      if let s = win.screen {
+        let w: CGFloat = 480, h: CGFloat = 270
+        win.setFrame(NSRect(x: s.visibleFrame.maxX - w - 16, y: s.visibleFrame.minY + 16, width: w, height: h), display: true)
+      }
+      win.level = .floating
+      web.evaluateJavaScript("window.__turbineHud && __turbineHud(false)")
+    } else {
+      if let f = savedNormal { win.setFrame(f, display: true) }
+      win.level = .normal
+      web.evaluateJavaScript("window.__turbineHud && __turbineHud(true)")
+    }
+    layout()
+  }
+
   // Shown once if macOS blocked reading the browser's data folder.
   var offeredGrant = false
   func offerGrant() {
@@ -331,6 +375,10 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
     let appItem = NSMenuItem(); main.addItem(appItem)
     let appMenu = NSMenu(); appItem.submenu = appMenu
     appMenu.addItem(withTitle: "Import Chrome Login", action: #selector(importChrome), keyEquivalent: "i").target = self
+    appMenu.addItem(.separator())
+    appMenu.addItem(withTitle: "Compact / Corner", action: #selector(toggleCompact), keyEquivalent: "k").target = self
+    appMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+    appMenu.addItem(withTitle: "Hide Turbine", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
     appMenu.addItem(.separator())
     appMenu.addItem(withTitle: "Quit Turbine", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     let editItem = NSMenuItem(); main.addItem(editItem)

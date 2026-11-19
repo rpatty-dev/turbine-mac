@@ -250,6 +250,7 @@
   window.__turbineMove = (dx, dy) => onMove({ movementX: dx, movementY: dy });
   window.__turbineLock = (on) => { nativeLocked = on; if (!on) releaseAll(); };
   window.__turbineStatus = (text) => { nativeStatus = text; renderHud(); };
+  window.__turbineHud = (on) => { if (hud) hud.style.display = on ? "" : "none"; };
 
   document.addEventListener("pointerlockchange", () => { if (!document.pointerLockElement) releaseAll(); });
   window.addEventListener("blur", releaseAll);

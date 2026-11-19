@@ -251,6 +251,8 @@
   window.__turbineLock = (on) => { nativeLocked = on; if (!on) releaseAll(); };
   window.__turbineStatus = (text) => { nativeStatus = text; renderHud(); };
   window.__turbineHud = (on) => { if (hud) hud.style.display = on ? "" : "none"; };
+  // Native app sets the right stick directly (final values, computed from mouse motion in Swift).
+  window.__turbineStick = (rx, ry) => { mouse[0] = rx; mouse[1] = ry; refresh(); };
 
   document.addEventListener("pointerlockchange", () => { if (!document.pointerLockElement) releaseAll(); });
   window.addEventListener("blur", releaseAll);

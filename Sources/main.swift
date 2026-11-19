@@ -237,7 +237,11 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
   var win: KeyWindow!, web: WKWebView!, overlay: NSWindow!, mtk: MTKView!, splash: SplashView!
   let renderer = Renderer()
   var stream: SCStream?
-  var locked = false, moveDX = 0.0, moveDY = 0.0, moveInFlight = false
+  var locked = false
+  var accumX = 0.0, accumY = 0.0            // mouse delta since last flush
+  var sensitivity = 0.05                     // stick units per pixel of mouse motion
+  var invertY = false
+  var flushTimer: Timer?
   var savedFrame: NSRect?
   var didLoad = false
 
@@ -443,25 +447,39 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
     locked = on
     CGAssociateMouseAndMouseCursorPosition(on ? 0 : 1)
     on ? NSCursor.hide() : NSCursor.unhide()
+    accumX = 0; accumY = 0
+    if on {
+      recenterCursor()
+      // Flush at the display rate: steady velocity from mouse speed, and 0 when the mouse is still.
+      let t = Timer(timeInterval: 1.0 / Double(NSScreen.main?.maximumFramesPerSecond ?? 120), repeats: true) { [weak self] _ in self?.flushLook() }
+      RunLoop.main.add(t, forMode: .common); flushTimer = t
+    } else {
+      flushTimer?.invalidate(); flushTimer = nil
+      web.evaluateJavaScript("window.__turbineStick && __turbineStick(0,0)")
+    }
     web.evaluateJavaScript("window.__turbineLock && __turbineLock(\(on))")
   }
 
-  // Coalesce mouse deltas so at most one JS call is in flight.
-  func queueMove(_ dx: Double, _ dy: Double) {
-    moveDX += dx; moveDY += dy
-    guard !moveInFlight else { return }
-    moveInFlight = true
-    let x = moveDX, y = moveDY; moveDX = 0; moveDY = 0
-    web.evaluateJavaScript("__turbineMove(\(x),\(y))") { [weak self] _, _ in
-      guard let self else { return }
-      self.moveInFlight = false
-      if self.moveDX != 0 || self.moveDY != 0 { self.queueMove(0, 0) }
-    }
+  // Keep the (hidden) cursor at screen centre so hitting an edge can't bias the look (the "stuck looking down" bug).
+  func recenterCursor() {
+    guard let s = win.screen else { return }
+    let c = CGPoint(x: s.frame.midX, y: s.frame.height - s.frame.midY)
+    CGWarpMouseCursorPosition(c)
+  }
+
+  // Send the right stick straight from accumulated mouse motion, then clear it. Camera stops the moment the mouse does.
+  func flushLook() {
+    guard locked else { return }
+    let clamp = { (v: Double) in max(-1, min(1, v)) }
+    let rx = clamp(accumX * sensitivity)
+    let ry = clamp(accumY * sensitivity * (invertY ? -1 : 1))
+    accumX = 0; accumY = 0
+    web.evaluateJavaScript("window.__turbineStick && __turbineStick(\(rx),\(ry))")
   }
 
   func installMonitors() {
     NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] e in
-      if let self, self.locked { self.queueMove(e.deltaX, e.deltaY) }
+      if let self, self.locked { self.accumX += e.deltaX; self.accumY += e.deltaY }
       return e
     }
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
@@ -470,11 +488,20 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavi
       case 53 where self.locked: self.setLock(false); return nil               // Esc
       case 98: self.renderer.frameGenOn.toggle(); self.updateOverlay()           // F7
       case 109: self.renderer.upscaleOn.toggle(); self.updateOverlay()           // F10
+      case 96: self.invertY.toggle(); self.flashSens("INVERT Y \(self.invertY ? "ON" : "OFF")")  // F5
+      case 27 where self.locked: self.sensitivity = max(0.01, self.sensitivity - 0.01); self.flashSens()  // minus: slower
+      case 24 where self.locked: self.sensitivity = min(0.3, self.sensitivity + 0.01); self.flashSens()   // equals: faster
       default:
         if e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "f" { self.toggleFullscreen(); return nil }
       }
       return e
     }
+  }
+
+  // Briefly show a sensitivity/invert message in the HUD.
+  func flashSens(_ msg: String? = nil) {
+    let text = msg ?? "SENS \(Int((sensitivity * 100).rounded()))"
+    web.evaluateJavaScript("window.__turbineStatus && __turbineStatus(\(jsString(text)))")
   }
 
   func updateOverlay() {
